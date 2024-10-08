@@ -2,13 +2,15 @@
  * Arduino APRS Tracker (aat) with Arduino Pro Mini 3.3V/8 MHz
  * Install the following libraries through Arduino Library Manager
  * - TinyGPS by Mikal Hart
- * -
- * -
+ * - Adafruit BME680
  ***/
 
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
 #include <LibAPRS.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME680.h>
 
 // Enable this define NEO6M if you are constantly getting wrong data,
 // the ADC ISR triggers during SoftwareSerial so we miss data coming from GPS
@@ -25,6 +27,10 @@
 TinyGPS gps;
 SoftwareSerial GPSSerial(GPS_RX_PIN, GPS_TX_PIN);
 
+// BME680 Pins
+#define BME680_I2C_ADDRESS 0x77
+Adafruit_BME680 bme;
+
 // LibAPRS
 #define OPEN_SQUELCH false
 #define ADC_REFERENCE REF_3V3
@@ -40,9 +46,7 @@ char APRS_CALLSIGN[] = "NOCALL";
 const int APRS_SSID = 5;
 char APRS_SYMBOL = '>';
 
-
 // SmartBeaconing(tm) Setting  http://www.hamhud.net/hh2/smartbeacon.html implementation by LU5EFN
-
 #define LOW_SPEED 5 // [km/h]
 #define HIGH_SPEED 90
 
@@ -58,12 +62,9 @@ long lat = 0;
 long lon = 0;
 
 int speed_kt = 0;
-int currentcourse = 0;
 int ialtitude_feet = 0;
 
-unsigned long lastTX = 0, tx_interval = 0;
-int previouscourse = 0, turn_threshold = 0, courseDelta = 0;
-
+unsigned long lastTX = 0, tx_interval = 600000; // 10 minutes
 bool newData = false;
 // buffer for conversions
 #define CONV_BUF_SIZE 16
@@ -81,15 +82,28 @@ void setup()
   GPSSerial.flush();
 #endif
 
+  // Initialize BME680
+  if (!bme.begin(BME680_I2C_ADDRESS)) {
+    Serial.println(F("Could not find a valid BME680 sensor, check wiring!"));
+    while (1);
+  }
+
+  // Set up oversampling and filter initialization
+  bme.setTemperatureOversampling(BME680_OS_8X);
+  bme.setHumidityOversampling(BME680_OS_2X);
+  bme.setPressureOversampling(BME680_OS_4X);
+  bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+  bme.setGasHeater(320, 150); // 320°C for 150 ms
+
   // Reduce NMEA messages
   disableGPGLL();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(GPS_FIX_LED,OUTPUT);
+  pinMode(GPS_FIX_LED, OUTPUT);
 
   Serial.println(F("Arduino APRS Tracker"));
 
   APRS_init(ADC_REFERENCE, OPEN_SQUELCH);
-  APRS_setCallsign(APRS_CALLSIGN,APRS_SSID);
+  APRS_setCallsign(APRS_CALLSIGN, APRS_SSID);
   APRS_setSymbol(APRS_SYMBOL);
 
   Serial.print(F("Callsign:     ")); Serial.print(APRS_CALLSIGN); Serial.print(F("-")); Serial.println(APRS_SSID);
@@ -105,10 +119,9 @@ static void smartdelay(unsigned long ms)
   do
   {
     while (GPSSerial.available())
-      {
-        if (gps.encode(GPSSerial.read())) newData = true;
-
-      }
+    {
+      if (gps.encode(GPSSerial.read())) newData = true;
+    }
   } while (millis() - start < ms);
 }
 
@@ -120,10 +133,10 @@ static void print_int(unsigned long val, unsigned long invalid, int len)
   else
     sprintf(sz, "%ld", val);
   sz[len] = 0;
-  for (int i=strlen(sz); i<len; ++i)
+  for (int i = strlen(sz); i < len; ++i)
     sz[i] = ' ';
   if (len > 0)
-    sz[len-1] = ' ';
+    sz[len - 1] = ' ';
   Serial.print(sz);
   smartdelay(0);
 }
@@ -142,7 +155,7 @@ static void print_float(float val, float invalid, int len, int prec)
     int vi = abs((int)val);
     int flen = prec + (val < 0.0 ? 2 : 1); // . and -
     flen += vi >= 1000 ? 4 : vi >= 100 ? 3 : vi >= 10 ? 2 : 1;
-    for (int i=flen; i<len; ++i)
+    for (int i = flen; i < len; ++i)
       Serial.print(' ');
   }
   smartdelay(0);
@@ -160,7 +173,7 @@ static void print_date(TinyGPS &gps)
   {
     char sz[32];
     sprintf(sz, "%02d/%02d/%02d %02d:%02d:%02d ",
-        month, day, year, hour, minute, second);
+            month, day, year, hour, minute, second);
     Serial.print(sz);
   }
   smartdelay(0);
@@ -169,10 +182,8 @@ static void print_date(TinyGPS &gps)
 void loop()
 {
   float flat, flon;
-
-  unsigned long age=0;
-
-  float faltitude_meters=0, fkmph=0;
+  unsigned long age = 0;
+  float faltitude_meters = 0, fkmph = 0;
 
   // Process GPS data every second (or so)
   smartdelay(1000);
@@ -186,7 +197,7 @@ void loop()
     gps.get_position(&lat, &lon, &age);
   }
 
-  if (newData && lat !=0)
+  if (newData && lat != 0)
   {
     // Parse twice the location with both float and long. Using float helps to paste it directly to google maps for troubleshooting
     gps.get_position(&lat, &lon, &age);
@@ -196,80 +207,61 @@ void loop()
     faltitude_meters = gps.f_altitude(); // +/- altitude in meters
 
     // Quick fix to ignore wrong data in calculations
-    if (int (faltitude_meters) > 30000) faltitude_meters =0;
-    ialtitude_feet = int(faltitude_meters*3.281);  // integer value of altitude in feet
+    if (int(faltitude_meters) > 30000) faltitude_meters = 0;
+    ialtitude_feet = int(faltitude_meters * 3.281); // integer value of altitude in feet
 
     fkmph = gps.f_speed_kmph(); // speed in km/h
 
     // Quick fix to ignore wrong data in calculations
-    if (int (fkmph) > 300) fkmph = 0;
+    if (int(fkmph) > 300) fkmph = 0;
 
-    speed_kt = (int) gps.f_speed_knots(); // speed in knots for APRS
-
-    // TinyGPS reports TinyGPS::GPS_INVALID_F_ANGLE = 1000.0 for invalid course
-    currentcourse = (int) gps.f_course();
-
-    // Quick fix to ignore wrong data in calculations
-    if (currentcourse > 360 || currentcourse < 0) currentcourse=0;
-
-    // Calculate difference of course to smartbeacon
-    courseDelta = (int) ( previouscourse - currentcourse );
-    courseDelta = abs (courseDelta);
-    if (courseDelta > 180) {
-      courseDelta = courseDelta - 360;
-    }
-    courseDelta = abs (courseDelta) ;
+    speed_kt = (int)gps.f_speed_knots(); // speed in knots for APRS
 
     digitalWrite(GPS_FIX_LED, !digitalRead(GPS_FIX_LED)); // Toggle the GPS_FIX_LED on/off
 
     print_date(gps);
     print_float(flat, TinyGPS::GPS_INVALID_F_ANGLE, 10, 6);
     print_float(flon, TinyGPS::GPS_INVALID_F_ANGLE, 11, 6);
-    print_float(gps.f_course(), TinyGPS::GPS_INVALID_F_ANGLE, 7, 2);
     print_float(fkmph, TinyGPS::GPS_INVALID_F_SPEED, 6, 2);
-    Serial.print(deg_to_nmea(lat, true));Serial.print(F("/"));Serial.print(deg_to_nmea(lon, false));
-    Serial.print(F(" ")); Serial.print(faltitude_meters);Serial.print(F("/"));Serial.print(ialtitude_feet);
+    Serial.print(deg_to_nmea(lat, true)); Serial.print(F("/")); Serial.print(deg_to_nmea(lon, false));
+    Serial.print(F(" ")); Serial.print(faltitude_meters); Serial.print(F("/")); Serial.print(ialtitude_feet);
 
-    // Based on HamHUB Smart Beaconing(tm) algorithm
-    if ( fkmph < LOW_SPEED ) {
-      tx_interval = SLOW_RATE *1000L;
-    }
-    else if ( fkmph > HIGH_SPEED) {
-      tx_interval = FAST_BEACON_RATE  *1000L;
-    }
-    else {
-    // Interval inbetween low and high speed
-      tx_interval = ((FAST_BEACON_RATE * HIGH_SPEED) / fkmph ) *1000L ;
-    }
-
-    turn_threshold = TURN_MIN + TURN_SLOPE / fkmph;
-
-    Serial.print(F(" "));Serial.print(currentcourse);Serial.print(F(" "));Serial.print(courseDelta);
-    Serial.print(F(" "));Serial.println(turn_threshold);
-
-    if (courseDelta > turn_threshold ){
-      if ( millis() - lastTX > MIN_TURN_TIME *1000L){
-        Serial.println(F("DEBUG: APRS UPDATE because of millis() - lastTX > MIN_TURN_TIME *1000L"));
-        locationUpdate();
-        lastTX = millis();
-      }
-    }
-
-    previouscourse = currentcourse;
-    // tx_internal with default values 1750000 milliseconds/1750 seconds/29.16 minutes
-    if ( millis() - lastTX > tx_interval) {
+    // Send updates every 10 minutes
+    if (millis() - lastTX > tx_interval) {
       Serial.println(F("DEBUG: APRS UPDATE because of millis() - lastTX > tx_interval"));
       locationUpdate();
       lastTX = millis();
     }
 
-    if (digitalRead(BUTTON_PIN)==0)
+    if (digitalRead(BUTTON_PIN) == 0)
     {
-      while(digitalRead(BUTTON_PIN)==0) {}; //debounce
+      while (digitalRead(BUTTON_PIN) == 0) {}; //debounce
       Serial.println(F("MANUAL UPDATE"));
       locationUpdate();
     }
   }
+
+  // Read BME680 data
+  if (! bme.performReading()) {
+    Serial.println("Failed to perform reading :(");
+    return;
+  }
+  Serial.print("Temperature = ");
+  Serial.print(bme.temperature);
+  Serial.println(" *C");
+
+  Serial.print("Pressure = ");
+  Serial.print(bme.pressure / 100.0);
+  Serial.println(" hPa");
+
+  Serial.print("Humidity = ");
+  Serial.print(bme.humidity);
+  Serial.println(" %");
+
+  Serial.print("Gas = ");
+  Serial.print(bme.gas_resistance / 1000.0);
+  Serial.println(" KOhms");
+
   newData = false;
 }
 
@@ -279,27 +271,24 @@ void aprs_msg_callback(struct AX25Msg *msg) {
 
 /*****************************************************************************************/
 void locationUpdate() {
-//Altitude in Comment Text — The comment may contain an altitude value,
-//in the form /A=aaaaaa, where aaaaaa is the altitude in feet. For example:
-//A=001234. The altitude may appear anywhere in the comment.
-//Source: APRS protocol
-//Which means /A=000XXXArduino APRS Tracker (29 characters)
-
-  char comment []= "Arduino APRS Tracker";
+  char comment[] = "Arduino APRS Tracker";
   char temp[8];
-  char APRS_comment [32]="/A=";
+  char APRS_comment[64] = "/A=";
 
   // Convert altitude in string and pad left
   sprintf(temp, "%06d", ialtitude_feet);
-  strcat(APRS_comment,temp);
-  strcat(APRS_comment,comment);
-  //Serial.println(APRS_comment);
+  strcat(APRS_comment, temp);
+  strcat(APRS_comment, comment);
+
+  // Add weather data to APRS comment
+  char weather[32];
+  sprintf(weather, " T=%.2fC H=%.2f%% P=%.2fhPa G=%.2fKOhms", bme.temperature, bme.humidity, bme.pressure / 100.0, bme.gas_resistance / 1000.0);
+  strcat(APRS_comment, weather);
 
   APRS_setLat((char*)deg_to_nmea(lat, true));
   APRS_setLon((char*)deg_to_nmea(lon, false));
 
   APRS_setSpeed(speed_kt);
-  APRS_setCourse(currentcourse);
 
   // turn off SoftSerial to stop interrupting tx
   GPSSerial.end();
@@ -307,14 +296,14 @@ void locationUpdate() {
   // TX
   APRS_sendLoc(APRS_comment, strlen(APRS_comment));
 
-  // read TX LED pin and wait till TX has finished. LibAPRS has TX_LED defined on (PB5), i use LED_BUILTIN on my version as TX_LED
-  while(digitalRead(LED_BUILTIN));
+  // read TX LED pin and wait till TX has finished. LibAPRS has TX_LED defined on (PB5), I use LED_BUILTIN on my version as TX_LED
+  while (digitalRead(LED_BUILTIN));
 
   // start SoftSerial again
 #ifdef NEO6M
-   GPSSerial.begin(4800);
+  GPSSerial.begin(4800);
 #else
-   GPSSerial.begin(9600);
+  GPSSerial.begin(9600);
 #endif
 }
 
@@ -326,8 +315,8 @@ void locationUpdate() {
 **  http://www.aprs.net/vm/DOS/PROTOCOL.HTM
 */
 char* deg_to_nmea(long deg, boolean is_lat) {
-  bool is_negative=0;
-  if (deg < 0) is_negative=1;
+  bool is_negative = 0;
+  if (deg < 0) is_negative = 1;
 
   // Use the absolute number for calculation and update the buffer at the end
   deg = labs(deg);
@@ -338,9 +327,10 @@ char* deg_to_nmea(long deg, boolean is_lat) {
 
   conv_buf[0] = '0';
   // in case latitude is a 3 digit number (degrees in long format)
-  if( a > 9999) {
-    snprintf(conv_buf , 6, "%04lu", a);
-  } else {
+  if (a > 9999) {
+    snprintf(conv_buf, 6, "%04lu", a);
+  }
+  else {
     snprintf(conv_buf + 1, 5, "%04lu", a);
   }
 
@@ -348,16 +338,16 @@ char* deg_to_nmea(long deg, boolean is_lat) {
   snprintf(conv_buf + 6, 3, "%02lu", b);
   conv_buf[9] = '\0';
   if (is_lat) {
-    if (is_negative) {conv_buf[8]='S';}
-    else conv_buf[8]='N';
-    return conv_buf+1;
+    if (is_negative) { conv_buf[8] = 'S'; }
+    else conv_buf[8] = 'N';
+    return conv_buf + 1;
     // conv_buf +1 because we want to omit the leading zero
-    }
+  }
   else {
-    if (is_negative) {conv_buf[8]='W';}
-    else conv_buf[8]='E';
+    if (is_negative) { conv_buf[8] = 'W'; }
+    else conv_buf[8] = 'E';
     return conv_buf;
-    }
+  }
 }
 
 void disableGPGLL()
@@ -371,7 +361,7 @@ void disableGPGLL()
 
   // convert and create checksum HEX string
   char checkTmp[8];
-  snprintf(checkTmp, sizeof(checkTmp)-1, "*%.2X", checksum);
+  snprintf(checkTmp, sizeof(checkTmp) - 1, "*%.2X", checksum);
 
   // send to module
   GPSSerial.print("$");
